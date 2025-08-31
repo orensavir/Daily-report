@@ -91,8 +91,8 @@ def seed_defaults():
         n = c.execute("SELECT COUNT(*) AS n FROM app_settings;").fetchone()["n"]
         if n == 0:
             defaults = [
-                ("app_title","ReportHub",None),
-                ("app_subtitle","מרכז תפעול יומי",None),
+                ("app_title","בית זיקוק אשדוד",None),
+                ("app_subtitle","דוח ייצור יומי",None),
                 ("dashboard_title","לוח בקרה תפעולי",None),
                 ("dashboard_subtitle","מרכז דיווח יומי וניהול",None),
                 ("submit_report_title","הגשת דיווח יומי",None),
