@@ -1,4 +1,4 @@
-# Daily_report.py — single-file Streamlit app (no triple quotes, no /mnt/data writes)
+# Daily_report.py — Hebrew UI, RTL, required names, directive permissions
 import os
 import json
 import sqlite3
@@ -11,7 +11,6 @@ import pandas as pd
 
 # ---------------- Writable data root ----------------
 def _resolve_data_root() -> Path:
-    # Prefer env override; else use OS temp directory (always writable on Streamlit Cloud)
     base = os.environ.get("REPORTHUB_DATA_DIR")
     if base:
         p = Path(base)
@@ -21,13 +20,33 @@ def _resolve_data_root() -> Path:
         (p / "uploads").mkdir(parents=True, exist_ok=True)
         return p
     except Exception:
-        # Ultimate fallback: a subfolder under temp dir
         p = Path(tempfile.gettempdir()) / "reporthub_data_fallback"
         (p / "uploads").mkdir(parents=True, exist_ok=True)
         return p
 
 DATA_ROOT = _resolve_data_root()
 DB_PATH = DATA_ROOT / "app.db"
+
+# ---------------- Simple auth / permissions ----------------
+def _normalize_list(val: str):
+    if not val:
+        return set()
+    items = [x.strip().lower() for x in val.split(",")]
+    return set([x for x in items if x])
+
+ADMINS = _normalize_list(os.environ.get("REPORTHUB_ADMINS", ""))
+DIRECTIVE_AUTHORS = _normalize_list(os.environ.get("REPORTHUB_DIRECTIVE_AUTHORS", ""))
+
+def is_admin(name_or_email: str) -> bool:
+    if not name_or_email:
+        return False
+    return name_or_email.strip().lower() in ADMINS
+
+def can_create_directive(name_or_email: str) -> bool:
+    if not name_or_email:
+        return False
+    x = name_or_email.strip().lower()
+    return (x in DIRECTIVE_AUTHORS) or (x in ADMINS)
 
 # ---------------- SQLite helpers ----------------
 def get_conn():
@@ -38,13 +57,11 @@ def get_conn():
 def init_db():
     with get_conn() as conn:
         c = conn.cursor()
-        # departments
         c.execute(
             "CREATE TABLE IF NOT EXISTS departments ("
             "id INTEGER PRIMARY KEY AUTOINCREMENT,"
             "name TEXT UNIQUE NOT NULL)"
         )
-        # app_settings
         c.execute(
             "CREATE TABLE IF NOT EXISTS app_settings ("
             "id INTEGER PRIMARY KEY AUTOINCREMENT,"
@@ -53,7 +70,6 @@ def init_db():
             "file_url TEXT,"
             "created_date TEXT NOT NULL DEFAULT (datetime('now')))"
         )
-        # department_reports
         c.execute(
             "CREATE TABLE IF NOT EXISTS department_reports ("
             "id INTEGER PRIMARY KEY AUTOINCREMENT,"
@@ -68,7 +84,6 @@ def init_db():
             "created_date TEXT NOT NULL DEFAULT (datetime('now')),"
             "created_by TEXT)"
         )
-        # directives
         c.execute(
             "CREATE TABLE IF NOT EXISTS directives ("
             "id INTEGER PRIMARY KEY AUTOINCREMENT,"
@@ -87,14 +102,13 @@ def init_db():
 def seed_defaults():
     with get_conn() as conn:
         c = conn.cursor()
-        # settings
         n = c.execute("SELECT COUNT(*) AS n FROM app_settings;").fetchone()["n"]
         if n == 0:
             defaults = [
-                ("app_title","בית זיקוק אשדוד",None),
-                ("app_subtitle","דוח ייצור יומי",None),
-                ("dashboard_title","לוח בקרה תפעולי",None),
-                ("dashboard_subtitle","מרכז דיווח יומי וניהול",None),
+                ("app_title","מרכז הדיווחים",None),
+                ("app_subtitle","מערכת דיווח יומית למחלקות",None),
+                ("dashboard_title","לוח בקרה",None),
+                ("dashboard_subtitle","סקירה כללית וסטטוס",None),
                 ("submit_report_title","הגשת דיווח יומי",None),
                 ("submit_report_subtitle","השלם את דיווח הפעילות היומית של המחלקה",None),
                 ("database_title","מאגר דיווחים",None),
@@ -104,7 +118,6 @@ def seed_defaults():
                 "INSERT OR IGNORE INTO app_settings (key,value,file_url) VALUES (?,?,?);",
                 defaults
             )
-        # departments
         n = c.execute("SELECT COUNT(*) AS n FROM departments;").fetchone()["n"]
         if n == 0:
             for name in ["ייצור","אחזקה","בטיחות","מעבדה","תכנון"]:
@@ -236,16 +249,38 @@ def get_setting_value(settings, key, default=""):
     m = {s["key"]: (s["file_url"] if (s.get("file_url") and str(s.get("file_url")).strip()) else s.get("value")) for s in settings}
     return m.get(key, default)
 
-# ---------------- UI ----------------
-st.set_page_config(page_title="ReportHub", page_icon="📋", layout="wide")
+# ---------------- UI setup (RTL + identity) ----------------
+st.set_page_config(page_title="מרכז הדיווחים", page_icon="📋", layout="wide")
+
+# Force RTL across the app
+rtl_css = "<style>" \
+          "html, body, [data-testid='stAppViewContainer'], [data-testid='stSidebar'] {direction: rtl;}" \
+          ".block-container {padding-top: 1rem;}" \
+          ".stMetric {text-align: right;}" \
+          "</style>"
+st.markdown(rtl_css, unsafe_allow_html=True)
 
 init_db()
 seed_defaults()
 settings = list_settings()
 
+# Sidebar identity (used for permissions and as default 'created_by')
+st.sidebar.header("זהות משתמש")
+user_name = st.sidebar.text_input("שם / מייל", value=st.session_state.get("user_name", ""))
+if user_name != st.session_state.get("user_name"):
+    st.session_state["user_name"] = user_name
+
+user_is_admin = is_admin(user_name)
+if user_is_admin:
+    st.sidebar.success("מחובר כמנהל")
+elif can_create_directive(user_name):
+    st.sidebar.info("יש לך הרשאה ליצור הנחיות")
+else:
+    st.sidebar.caption("אין הרשאות מנהל או יצירת הנחיות")
+
 # Header
-title = get_setting_value(settings, "app_title", "ReportHub")
-subtitle = get_setting_value(settings, "app_subtitle", "מרכז תפעול יומי")
+title = get_setting_value(settings, "app_title", "מרכז הדיווחים")
+subtitle = get_setting_value(settings, "app_subtitle", "מערכת דיווח יומית למחלקות")
 logo = get_setting_value(settings, "app_logo", "")
 
 c1, c2 = st.columns([1, 6])
@@ -259,13 +294,14 @@ with c2:
     st.title(title)
     st.caption(subtitle)
 
-st.sidebar.title("ניווט")
-page = st.sidebar.radio("לעמוד:", ["Dashboard", "Submit Report", "Directives", "Database", "Admin Settings"], index=0)
+# Pages
+st.sidebar.markdown("---")
+page = st.sidebar.radio("ניווט", ["לוח בקרה", "הגשת דיווח", "הנחיות", "מאגר דיווחים", "הגדרות מנהל"], index=0)
 
 # ---------- Pages ----------
-if page == "Dashboard":
-    st.subheader(get_setting_value(settings, "dashboard_title", "לוח בקרה תפעולי"))
-    st.caption(get_setting_value(settings, "dashboard_subtitle", "מרכז דיווח יומי וניהול"))
+if page == "לוח בקרה":
+    st.subheader(get_setting_value(settings, "dashboard_title", "לוח בקרה"))
+    st.caption(get_setting_value(settings, "dashboard_subtitle", "סקירה כללית וסטטוס"))
 
     reports = list_reports(order="-created_date")
     directives = list_directives(order="-created_date")
@@ -297,10 +333,10 @@ if page == "Dashboard":
     if not directives:
         st.info("אין הנחיות.")
     for drow in directives[:5]:
-        st.write(f'**{drow["title"]}** — {drow["priority"]} — Due: {drow["due_date"]} — {len(drow["target_departments"])} מחלקות')
+        st.write(f'**{drow["title"]}** — {drow["priority"]} — תאריך יעד: {drow["due_date"]} — {len(drow["target_departments"])} מחלקות')
         st.caption(drow["description"])
 
-elif page == "Submit Report":
+elif page == "הגשת דיווח":
     st.subheader(get_setting_value(settings, "submit_report_title", "הגשת דיווח יומי"))
     st.caption(get_setting_value(settings, "submit_report_subtitle", "השלם את דיווח הפעילות היומית של המחלקה"))
 
@@ -308,14 +344,14 @@ elif page == "Submit Report":
     dept_names = [d["name"] for d in depts]
 
     with st.form("report_form", clear_on_submit=True):
-        c1, c2 = st.columns(2)
-        with c1:
-            department = st.selectbox("מחלקה*", options=dept_names)
-        with c2:
-            report_date = st.date_input("תאריך דיווח", value=date.today())
+        c_top1, c_top2 = st.columns(2)
+        with c_top1:
+            department = st.selectbox("מחלקה *", options=dept_names)
+        with c_top2:
+            report_date = st.date_input("תאריך דיווח *", value=date.today())
 
-        key_activities = st.text_area("פעילויות מרכזיות היום*", height=120)
-        production_amounts = st.text_area("כמויות ייצור*", height=120)
+        key_activities = st.text_area("פעילויות מרכזיות היום *", height=120)
+        production_amounts = st.text_area("כמויות ייצור *", height=120)
         challenges = st.text_area("אתגרים ובעיות", height=80)
 
         st.markdown("**מדדים יומיים**")
@@ -328,11 +364,13 @@ elif page == "Submit Report":
             priority_level = st.selectbox("רמת עדיפות", options=["Low", "Medium", "High", "Critical"], index=1)
 
         additional_notes = st.text_area("הערות נוספות", height=80)
-        created_by = st.text_input("שם/מייל המדווח (לא חובה)", value="")
+        created_by_input = st.text_input("שם / מייל המדווח *", value=(user_name or ""))
 
         submitted = st.form_submit_button("הגש דיווח")
         if submitted:
-            if not (department and key_activities and production_amounts):
+            if not created_by_input.strip():
+                st.error("יש להזין שם/מייל מדווח.")
+            elif not (department and key_activities and production_amounts):
                 st.error("שדות חובה חסרים.")
             else:
                 data = dict(
@@ -348,16 +386,16 @@ elif page == "Submit Report":
                     },
                     additional_notes=(additional_notes or None),
                     status="submitted",
-                    created_by=(created_by or None)
+                    created_by=created_by_input.strip()
                 )
                 create_report(data)
                 st.success(f"דיווח למחלקת {department} הוגש בהצלחה!")
 
-elif page == "Directives":
+elif page == "הנחיות":
     st.subheader("הנחיות")
-    tab1, tab2 = st.tabs(["רשימת הנחיות", "יצירת הנחיה"])
+    t_list, t_create = st.tabs(["רשימת הנחיות", "יצירת הנחיה"])
 
-    with tab1:
+    with t_list:
         directives = list_directives(order="-created_date")
         if not directives:
             st.info("אין הנחיות.")
@@ -367,9 +405,9 @@ elif page == "Directives":
                 with c1:
                     st.markdown(f"**{drow['title']}**")
                     st.write(drow["description"])
-                    st.caption("Departments: " + ", ".join(drow["target_departments"]))
+                    st.caption("מחלקות יעד: " + ", ".join(drow["target_departments"]))
                 with c2:
-                    st.metric("Priority", drow["priority"])
+                    st.metric("עדיפות", drow["priority"])
                 with c3:
                     status = drow["status"]
                     try:
@@ -378,64 +416,72 @@ elif page == "Directives":
                             status = "overdue"
                     except Exception:
                         pass
-                    st.metric("Status", status)
+                    st.metric("סטטוס", "באיחור" if status == "overdue" else ("הושלם" if status == "completed" else "פעיל"))
                 with c4:
-                    st.metric("Due", drow["due_date"])
+                    st.metric("תאריך יעד", drow["due_date"])
 
-                if drow["status"] == "active":
-                    if st.button(f"Mark complete #{drow['id']}", key=f"complete_{drow['id']}"):
+                if user_is_admin and drow["status"] == "active":
+                    if st.button(f"סמן כהושלם #{drow['id']}", key=f"complete_{drow['id']}"):
                         update_directive_status(drow["id"], "completed")
                         st.success("סטטוס ההנחיה עודכן בהצלחה!")
                         st.rerun()
                 st.divider()
 
-    with tab2:
-        depts = list_departments()
-        dept_names = [d["name"] for d in depts]
-        with st.form("directive_form", clear_on_submit=True):
-            title = st.text_input("כותרת ההנחיה *")
-            description = st.text_area("תיאור *", height=120)
-            priority = st.selectbox("רמת עדיפות", ["Low", "Medium", "High", "Urgent"], index=1)
-            due_date = st.date_input("תאריך יעד *", value=date.today())
-            target_departments = st.multiselect("מחלקות יעד *", options=dept_names, default=[])
-            created_by = st.text_input("יוצר (לא חובה)", value="")
-            submitted = st.form_submit_button("צור הנחיה")
-            if submitted:
-                if not (title and description and target_departments and due_date):
-                    st.error("שדות חובה חסרים.")
-                else:
-                    data = dict(
-                        title=title,
-                        description=description,
-                        priority=priority,
-                        target_departments=target_departments,
-                        due_date=due_date,
-                        status="active",
-                        created_by=(created_by or None)
-                    )
-                    create_directive(data)
-                    st.success("ההנחיה נוצרה בהצלחה ונשלחה למחלקות היעד!")
+    with t_create:
+        if not can_create_directive(user_name):
+            st.warning("אין לך הרשאה ליצור הנחיות. פנה למנהל המערכת.")
+        else:
+            depts = list_departments()
+            dept_names = [d["name"] for d in depts]
+            with st.form("directive_form", clear_on_submit=True):
+                title = st.text_input("כותרת ההנחיה *")
+                description = st.text_area("תיאור *", height=120)
+                priority = st.selectbox("רמת עדיפות", ["Low", "Medium", "High", "Urgent"], index=1)
+                due_date = st.date_input("תאריך יעד *", value=date.today())
+                target_departments = st.multiselect("מחלקות יעד *", options=dept_names, default=[])
+                created_by_input = st.text_input("שם / מייל יוצר ההנחיה *", value=(user_name or ""))
 
-elif page == "Database":
+                submitted = st.form_submit_button("צור הנחיה")
+                if submitted:
+                    if not created_by_input.strip():
+                        st.error("יש להזין שם/מייל יוצר.")
+                    elif not (title and description and target_departments and due_date):
+                        st.error("שדות חובה חסרים.")
+                    elif not can_create_directive(created_by_input):
+                        st.error("אין הרשאה למשתמש זה ליצור הנחיות.")
+                    else:
+                        data = dict(
+                            title=title,
+                            description=description,
+                            priority=priority,
+                            target_departments=target_departments,
+                            due_date=due_date,
+                            status="active",
+                            created_by=created_by_input.strip()
+                        )
+                        create_directive(data)
+                        st.success("ההנחיה נוצרה בהצלחה ונשלחה למחלקות היעד!")
+
+elif page == "מאגר דיווחים":
     st.subheader(get_setting_value(settings, "database_title", "מאגר דיווחים"))
     st.caption(get_setting_value(settings, "database_subtitle", "חיפוש, צפייה וייצוא כל דיווחי המחלקות"))
 
     departments = list_departments()
-    dept_names = ["(All)"] + [d["name"] for d in departments]
+    dept_names = ["(הכול)"] + [d["name"] for d in departments]
     reports = list_reports(order="-created_date")
 
     c1, c2, c3, c4 = st.columns([2, 2, 2, 3])
     with c1:
-        dept = st.selectbox("Department", dept_names)
+        dept = st.selectbox("מחלקה", dept_names)
     with c2:
-        from_date = st.date_input("From Date", value=None)
+        from_date = st.date_input("מתאריך", value=None)
     with c3:
-        to_date = st.date_input("To Date", value=None)
+        to_date = st.date_input("עד תאריך", value=None)
     with c4:
-        search = st.text_input("Search text", value="")
+        search = st.text_input("חיפוש טקסט", value="")
 
     def include(r):
-        if dept != "(All)" and r["department"] != dept:
+        if dept != "(הכול)" and r["department"] != dept:
             return False
         if from_date:
             try:
@@ -467,13 +513,13 @@ elif page == "Database":
         m = r.get("metrics") or {}
         total = int(m.get("tasks_completed", 0)) + int(m.get("tasks_pending", 0))
         return {
-            "Department": r["department"],
-            "Date": r["report_date"],
-            "Priority": m.get("priority_level", "Medium"),
-            "Tasks": f"{int(m.get('tasks_completed', 0))}/{total}",
-            "Status": r.get("status", "submitted"),
-            "Created": r.get("created_date", ""),
-            "By": r.get("created_by", "") or ""
+            "מחלקה": r["department"],
+            "תאריך": r["report_date"],
+            "עדיפות": m.get("priority_level", "Medium"),
+            "משימות": f"{int(m.get('tasks_completed', 0))}/{total}",
+            "סטטוס": r.get("status", "submitted"),
+            "נוצר": r.get("created_date", ""),
+            "יוצר": r.get("created_by", "") or ""
         }
 
     df = pd.DataFrame([to_row(x) for x in filtered])
@@ -481,97 +527,100 @@ elif page == "Database":
 
     if not df.empty:
         csv = df.to_csv(index=False).encode("utf-8-sig")
-        st.download_button("Download CSV", data=csv, file_name=f"reports_{date.today().isoformat()}.csv", mime="text/csv")
+        st.download_button("הורד CSV", data=csv, file_name=f"reports_{date.today().isoformat()}.csv", mime="text/csv")
     else:
-        st.info("No reports match the current filters.")
+        st.info("לא נמצאו דיווחים תואמים למסננים.")
 
     st.markdown("---")
-    st.subheader("Report Details")
+    st.subheader("פרטי דיווח")
     if filtered:
-        idx = st.number_input("Enter row index to view (0-based)", min_value=0, max_value=len(filtered) - 1, value=0)
+        idx = st.number_input("בחר אינדקס (0-מבוסס)", min_value=0, max_value=len(filtered) - 1, value=0)
         r = filtered[int(idx)]
         st.write(f"### {r['department']} — {r['report_date']}")
         m = r.get("metrics") or {}
         c1x, c2x, c3x = st.columns(3)
         with c1x:
-            st.metric("Completed Tasks", int(m.get("tasks_completed", 0)))
+            st.metric("משימות שהושלמו", int(m.get("tasks_completed", 0)))
         with c2x:
-            st.metric("Pending Tasks", int(m.get("tasks_pending", 0)))
+            st.metric("משימות ממתינות", int(m.get("tasks_pending", 0)))
         with c3x:
-            st.metric("Priority", m.get("priority_level", "Medium"))
-        st.write("**Key Activities**\n\n" + (r.get("key_activities", "") or ""))
-        st.write("**Production Amounts**\n\n" + (r.get("production_amounts", "") or ""))
+            st.metric("רמת עדיפות", m.get("priority_level", "Medium"))
+        st.write("**פעילויות מרכזיות**\n\n" + (r.get("key_activities", "") or ""))
+        st.write("**כמויות ייצור**\n\n" + (r.get("production_amounts", "") or ""))
         if r.get("challenges"):
-            st.write("**Challenges & Issues**\n\n" + r["challenges"])
+            st.write("**אתגרים ובעיות**\n\n" + r["challenges"])
         if r.get("additional_notes"):
-            st.write("**Additional Notes**\n\n" + r["additional_notes"])
-        st.caption(f"Submitted: {r.get('created_date','')} | By: {r.get('created_by','') or ''}")
+            st.write("**הערות נוספות**\n\n" + r["additional_notes"])
+        st.caption(f"נוצר: {r.get('created_date','')} | על ידי: {r.get('created_by','') or ''}")
     else:
-        st.info("No selected report.")
+        st.info("אין דיווח נבחר.")
 
 else:
-    st.subheader("הגדרות מנהל")
+    if not user_is_admin:
+        st.error("גישה נדחתה: רק מנהלים יכולים לגשת להגדרות מנהל.")
+    else:
+        st.subheader("הגדרות מנהל")
 
-    st.markdown("#### לוגו היישום")
-    current_logo = next((s for s in settings if s["key"] == "app_logo"), None)
-    if current_logo and (current_logo.get("file_url") or current_logo.get("value")):
-        st.image(current_logo.get("file_url") or current_logo.get("value"), width=120, caption="לוגו נוכחי")
-    up = st.file_uploader("העלה לוגו (PNG/JPG)", type=["png","jpg","jpeg"])
-    if up is not None:
-        path = DATA_ROOT / "uploads" / (datetime.utcnow().strftime("%Y%m%d%H%M%S") + "_" + up.name)
-        with open(path, "wb") as f:
-            f.write(up.getbuffer())
-        set_setting("app_logo", value=str(path), file_url=str(path))
-        st.success("הלוגו עודכן.")
-        st.rerun()
-
-    if st.button("הסר לוגו"):
-        set_setting("app_logo", value=None, file_url=None)
-        st.success("הלוגו הוסר.")
-        st.rerun()
-
-    st.markdown("---")
-    st.markdown("#### ניהול טקסטים ביישום")
-    keys = [
-        "app_title","app_subtitle",
-        "dashboard_title","dashboard_subtitle",
-        "submit_report_title","submit_report_subtitle",
-        "database_title","database_subtitle"
-    ]
-    settings_map = {s["key"]: s for s in list_settings()}
-    edits = {}
-    cols = st.columns(2)
-    for i, k in enumerate(keys):
-        with cols[i % 2]:
-            edits[k] = st.text_input(k.replace("_", " ").title(), value=(settings_map.get(k, {}).get("value") or ""))
-    if st.button("שמור טקסטים"):
-        for k, v in edits.items():
-            set_setting(k, value=v)
-        st.success("הטקסטים נשמרו.")
-        st.rerun()
-
-    st.markdown("---")
-    st.markdown("#### ניהול מחלקות")
-    depts = list_departments()
-    new_name = st.text_input("שם מחלקה חדשה", value="")
-    if st.button("הוסף"):
-        if new_name.strip():
-            create_department(new_name.strip())
-            st.success("נוספה מחלקה.")
+        st.markdown("#### לוגו היישום")
+        current_logo = next((s for s in settings if s["key"] == "app_logo"), None)
+        if current_logo and (current_logo.get("file_url") or current_logo.get("value")):
+            st.image(current_logo.get("file_url") or current_logo.get("value"), width=120, caption="לוגו נוכחי")
+        up = st.file_uploader("העלה לוגו (PNG/JPG)", type=["png","jpg","jpeg"])
+        if up is not None:
+            path = DATA_ROOT / "uploads" / (datetime.utcnow().strftime("%Y%m%d%H%M%S") + "_" + up.name)
+            with open(path, "wb") as f:
+                f.write(up.getbuffer())
+            set_setting("app_logo", value=str(path), file_url=str(path))
+            st.success("הלוגו עודכן.")
             st.rerun()
 
-    st.write("### רשימת מחלקות")
-    for d in depts:
-        c1, c2, c3 = st.columns([3, 1, 1])
-        with c1:
-            new_val = st.text_input("שם למחלקה #" + str(d["id"]), value=d["name"], key="dept_" + str(d["id"]))
-        with c2:
-            if st.button("שמור", key="save_" + str(d["id"])):
-                update_department(d["id"], new_val)
-                st.success("עודכן.")
+        if st.button("הסר לוגו"):
+            set_setting("app_logo", value=None, file_url=None)
+            st.success("הלוגו הוסר.")
+            st.rerun()
+
+        st.markdown("---")
+        st.markdown("#### ניהול טקסטים ביישום")
+        keys = [
+            "app_title","app_subtitle",
+            "dashboard_title","dashboard_subtitle",
+            "submit_report_title","submit_report_subtitle",
+            "database_title","database_subtitle"
+        ]
+        settings_map = {s["key"]: s for s in list_settings()}
+        edits = {}
+        cols = st.columns(2)
+        for i, k in enumerate(keys):
+            with cols[i % 2]:
+                edits[k] = st.text_input(k.replace("_", " ").title(), value=(settings_map.get(k, {}).get("value") or ""))
+        if st.button("שמור טקסטים"):
+            for k, v in edits.items():
+                set_setting(k, value=v)
+            st.success("הטקסטים נשמרו.")
+            st.rerun()
+
+        st.markdown("---")
+        st.markdown("#### ניהול מחלקות")
+        depts = list_departments()
+        new_name = st.text_input("שם מחלקה חדשה", value="")
+        if st.button("הוסף"):
+            if new_name.strip():
+                create_department(new_name.strip())
+                st.success("נוספה מחלקה.")
                 st.rerun()
-        with c3:
-            if st.button("מחק", key="del_" + str(d["id"])):
-                delete_department(d["id"])
-                st.warning("נמחק.")
-                st.rerun()
+
+        st.write("### רשימת מחלקות")
+        for d in depts:
+            c1, c2, c3 = st.columns([3, 1, 1])
+            with c1:
+                new_val = st.text_input("שם למחלקה #" + str(d["id"]), value=d["name"], key="dept_" + str(d["id"]))
+            with c2:
+                if st.button("שמור", key="save_" + str(d["id"])):
+                    update_department(d["id"], new_val)
+                    st.success("עודכן.")
+                    st.rerun()
+            with c3:
+                if st.button("מחק", key="del_" + str(d["id"])):
+                    delete_department(d["id"])
+                    st.warning("נמחק.")
+                    st.rerun()
