@@ -126,12 +126,29 @@ def seed_defaults():
                 "INSERT OR IGNORE INTO app_settings (key,value,file_url) VALUES (?,?,?);",
                 defaults
             )
-        # departments
+
+        # departments – ברירת מחדל לפי הרשימה שסיפקת
         n = c.execute("SELECT COUNT(*) AS n FROM departments;").fetchone()["n"]
         if n == 0:
-            for name in ["ייצור","אחזקה","בטיחות","מעבדה","תכנון"]:
+            dept_defaults = [
+                "אזור א'",
+                "אזור אחזקה יעקב",
+                "אזור איכות סביבה",
+                "אזור אנרגיה וגלם",
+                "אזור ב'",
+                "אזור בטיחות",
+                "אזור ד'",
+                "אזור ה'",
+                "אזור חווה",
+                'אזור מט"ש',
+                "אזור מסוף",
+                "אזור מעבדה",
+                "אזור מפקח משמרת",
+            ]
+            for name in dept_defaults:
                 c.execute("INSERT OR IGNORE INTO departments (name) VALUES (?);", (name,))
         conn.commit()
+
 
 # ---------------- Users (CRUD + Auth) ----------------
 def find_user_by_email(email: str):
@@ -492,15 +509,52 @@ if page == "לוח בקרה":
     c.metric("הנחיות פעילות", f"{len(active_directives)}")
     d.metric("סה\"כ דיווחים", f"{len(reports)}")
 
+    # ---- מיון תצוגת מחלקות ----
     st.markdown("### סטטוס מחלקות היום")
+    sort_choice = st.selectbox(
+        "מיין מחלקות לפי:",
+        options=["לפי א״ב", "לפי זמן הדיווח האחרון"],
+        index=0,
+        help="מיון לפי שם המחלקה או לפי מועד הדיווח האחרון שנשלח היום."
+    )
+
+    # מפה: מחלקה -> זמן הדיווח האחרון (היום)
+    last_time_map = {}
+    for r in today_reports:
+        dept_name = r["department"]
+        # created_date בפורמט ISO; ננסה לפענח
+        dt = None
+        try:
+            dt = datetime.fromisoformat((r.get("created_date") or "").replace("Z",""))
+        except Exception:
+            dt = None
+        if dt:
+            if dept_name not in last_time_map or dt > last_time_map[dept_name]:
+                last_time_map[dept_name] = dt
+
+    # מיון רשימת המחלקות
+    if sort_choice == "לפי א״ב":
+        dep_sorted = sorted(departments, key=lambda d: d["name"])
+    else:
+        # לפי זמן הדיווח האחרון: אלו שדיווחו היום ממוינים מהאחרון לראשון, ואז אלו שלא דיווחו
+        dep_sorted = sorted(
+            departments,
+            key=lambda d: (last_time_map.get(d["name"]) is None,  # מי שלא דיווח בסוף
+                           datetime.min if last_time_map.get(d["name"]) is None else -last_time_map.get(d["name"]).timestamp())
+        )
+
+    # תצוגה ב-3 טורים + שעה אם קיימת
     cols = st.columns(3)
-    for i, dept in enumerate(departments):
+    for i, dept in enumerate(dep_sorted):
         with cols[i % 3]:
-            ok = any(r["department"] == dept["name"] and r["report_date"] == tday for r in reports)
-            if ok:
+            last_dt = last_time_map.get(dept["name"])
+            if last_dt:
                 st.success(f'{dept["name"]} — הוגש', icon="✅")
+                st.caption(f'שעת הגשה: {last_dt.strftime("%H:%M")}')
             else:
                 st.warning(f'{dept["name"]} — ממתין', icon="⏳")
+
+
 
     st.markdown("### הנחיות אחרונות")
     if not directives:
