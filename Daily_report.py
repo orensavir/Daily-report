@@ -1,8 +1,10 @@
-# Daily_report.py — Hebrew UI, RTL, required names, directive permissions
+# Daily_report.py — Hebrew UI, RTL, login with users DB, admin/user roles, directive permissions
 import os
 import json
 import sqlite3
 import tempfile
+import hashlib
+import secrets
 from pathlib import Path
 from datetime import datetime, date
 
@@ -27,26 +29,14 @@ def _resolve_data_root() -> Path:
 DATA_ROOT = _resolve_data_root()
 DB_PATH = DATA_ROOT / "app.db"
 
-# ---------------- Simple auth / permissions ----------------
-def _normalize_list(val: str):
-    if not val:
-        return set()
-    items = [x.strip().lower() for x in val.split(",")]
-    return set([x for x in items if x])
+# ---------------- Password hashing helpers ----------------
+def _hash_password(password: str, salt: str) -> str:
+    h = hashlib.sha256()
+    h.update((salt + password).encode("utf-8"))
+    return h.hexdigest()
 
-ADMINS = _normalize_list(os.environ.get("REPORTHUB_ADMINS", ""))
-DIRECTIVE_AUTHORS = _normalize_list(os.environ.get("REPORTHUB_DIRECTIVE_AUTHORS", ""))
-
-def is_admin(name_or_email: str) -> bool:
-    if not name_or_email:
-        return False
-    return name_or_email.strip().lower() in ADMINS
-
-def can_create_directive(name_or_email: str) -> bool:
-    if not name_or_email:
-        return False
-    x = name_or_email.strip().lower()
-    return (x in DIRECTIVE_AUTHORS) or (x in ADMINS)
+def _new_salt() -> str:
+    return secrets.token_hex(16)
 
 # ---------------- SQLite helpers ----------------
 def get_conn():
@@ -57,11 +47,13 @@ def get_conn():
 def init_db():
     with get_conn() as conn:
         c = conn.cursor()
+        # departments
         c.execute(
             "CREATE TABLE IF NOT EXISTS departments ("
             "id INTEGER PRIMARY KEY AUTOINCREMENT,"
             "name TEXT UNIQUE NOT NULL)"
         )
+        # app_settings
         c.execute(
             "CREATE TABLE IF NOT EXISTS app_settings ("
             "id INTEGER PRIMARY KEY AUTOINCREMENT,"
@@ -70,6 +62,7 @@ def init_db():
             "file_url TEXT,"
             "created_date TEXT NOT NULL DEFAULT (datetime('now')))"
         )
+        # department_reports
         c.execute(
             "CREATE TABLE IF NOT EXISTS department_reports ("
             "id INTEGER PRIMARY KEY AUTOINCREMENT,"
@@ -84,6 +77,7 @@ def init_db():
             "created_date TEXT NOT NULL DEFAULT (datetime('now')),"
             "created_by TEXT)"
         )
+        # directives
         c.execute(
             "CREATE TABLE IF NOT EXISTS directives ("
             "id INTEGER PRIMARY KEY AUTOINCREMENT,"
@@ -97,11 +91,25 @@ def init_db():
             "created_date TEXT NOT NULL DEFAULT (datetime('now')),"
             "created_by TEXT)"
         )
+        # users
+        c.execute(
+            "CREATE TABLE IF NOT EXISTS users ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "name TEXT NOT NULL,"
+            "email TEXT UNIQUE NOT NULL,"
+            "role TEXT NOT NULL CHECK (role IN ('admin','user')),"
+            "can_create_directives INTEGER NOT NULL DEFAULT 0,"
+            "is_active INTEGER NOT NULL DEFAULT 1,"
+            "password_hash TEXT,"
+            "salt TEXT,"
+            "created_date TEXT NOT NULL DEFAULT (datetime('now')))"
+        )
         conn.commit()
 
 def seed_defaults():
     with get_conn() as conn:
         c = conn.cursor()
+        # settings
         n = c.execute("SELECT COUNT(*) AS n FROM app_settings;").fetchone()["n"]
         if n == 0:
             defaults = [
@@ -118,13 +126,96 @@ def seed_defaults():
                 "INSERT OR IGNORE INTO app_settings (key,value,file_url) VALUES (?,?,?);",
                 defaults
             )
+        # departments
         n = c.execute("SELECT COUNT(*) AS n FROM departments;").fetchone()["n"]
         if n == 0:
             for name in ["ייצור","אחזקה","בטיחות","מעבדה","תכנון"]:
                 c.execute("INSERT OR IGNORE INTO departments (name) VALUES (?);", (name,))
         conn.commit()
 
-# ---------------- Queries ----------------
+def bootstrap_admin_if_needed():
+    with get_conn() as conn:
+        c = conn.cursor()
+        n = c.execute("SELECT COUNT(*) AS n FROM users;").fetchone()["n"]
+        if n == 0:
+            # Bootstrap admin on first run. You can override via env vars.
+            email = os.environ.get("REPORTHUB_BOOTSTRAP_ADMIN_EMAIL", "admin@local")
+            pwd = os.environ.get("REPORTHUB_BOOTSTRAP_ADMIN_PASSWORD", "admin")
+            name = os.environ.get("REPORTHUB_BOOTSTRAP_ADMIN_NAME", "מנהל מערכת")
+            salt = _new_salt()
+            ph = _hash_password(pwd, salt)
+            c.execute(
+                "INSERT INTO users (name,email,role,can_create_directives,is_active,password_hash,salt) "
+                "VALUES (?,?,?,?,?,?,?);",
+                (name, email.lower().strip(), "admin", 1, 1, ph, salt)
+            )
+            conn.commit()
+
+# ---------------- Users (CRUD + Auth) ----------------
+def list_users():
+    with get_conn() as conn:
+        rows = conn.execute("SELECT * FROM users ORDER BY role DESC, name;").fetchall()
+        return [dict(r) for r in rows]
+
+def find_user_by_email(email: str):
+    if not email:
+        return None
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM users WHERE lower(email)=?;", (email.strip().lower(),)).fetchone()
+        return dict(row) if row else None
+
+def create_or_update_user(name, email, role, is_active, can_create_directives, password=None):
+    email_norm = (email or "").strip().lower()
+    if not (name and email_norm and role in ("admin","user")):
+        return
+    with get_conn() as conn:
+        cur = conn.execute("SELECT id,salt FROM users WHERE email=?;", (email_norm,)).fetchone()
+        if cur:
+            uid = cur["id"]
+            if password:
+                salt = _new_salt()
+                ph = _hash_password(password, salt)
+                conn.execute(
+                    "UPDATE users SET name=?, role=?, is_active=?, can_create_directives=?, password_hash=?, salt=? WHERE id=?;",
+                    (name, role, 1 if is_active else 0, 1 if can_create_directives else 0, ph, salt, uid)
+                )
+            else:
+                conn.execute(
+                    "UPDATE users SET name=?, role=?, is_active=?, can_create_directives=? WHERE id=?;",
+                    (name, role, 1 if is_active else 0, 1 if can_create_directives else 0, uid)
+                )
+        else:
+            salt = _new_salt()
+            ph = _hash_password(password or "changeme", salt)
+            conn.execute(
+                "INSERT INTO users (name,email,role,is_active,can_create_directives,password_hash,salt) "
+                "VALUES (?,?,?,?,?,?,?);",
+                (name, email_norm, role, 1 if is_active else 0, 1 if can_create_directives else 0, ph, salt)
+            )
+        conn.commit()
+
+def set_user_password(user_id: int, new_password: str):
+    if not new_password:
+        return
+    with get_conn() as conn:
+        salt = _new_salt()
+        ph = _hash_password(new_password, salt)
+        conn.execute("UPDATE users SET password_hash=?, salt=? WHERE id=?;", (ph, salt, user_id))
+        conn.commit()
+
+def verify_login(email: str, password: str):
+    u = find_user_by_email(email)
+    if not u:
+        return None
+    if not u.get("is_active"):
+        return None
+    salt = u.get("salt") or ""
+    ph = _hash_password(password or "", salt)
+    if ph == (u.get("password_hash") or ""):
+        return u
+    return None
+
+# ---------------- Settings & Data (Reports/Directives) ----------------
 def list_departments():
     with get_conn() as conn:
         rows = conn.execute("SELECT id,name FROM departments ORDER BY name;").fetchall()
@@ -176,14 +267,15 @@ def list_reports(order="-created_date"):
         for r in rows:
             d = dict(r)
             d["metrics"] = json.loads(d["metrics"]) if d["metrics"] else {}
-            out.append(d)
+            return_row = d
+            out.append(return_row)
         return out
 
 def create_report(data):
     metrics = data.get("metrics") or {}
     he_map = {"נמוכה":"Low","בינונית":"Medium","גבוהה":"High","קריטית":"Critical"}
     if metrics.get("priority_level") in he_map:
-        metrics["priority_level"] = he_map[metrics["priority_level"]]
+        metrics["priority_level"] = he_map["priority_level"]
     payload = (
         data["department"],
         str(data["report_date"]),
@@ -249,10 +341,9 @@ def get_setting_value(settings, key, default=""):
     m = {s["key"]: (s["file_url"] if (s.get("file_url") and str(s.get("file_url")).strip()) else s.get("value")) for s in settings}
     return m.get(key, default)
 
-# ---------------- UI setup (RTL + identity) ----------------
+# ---------------- UI setup (RTL) ----------------
 st.set_page_config(page_title="מרכז הדיווחים", page_icon="📋", layout="wide")
 
-# Force RTL across the app
 rtl_css = "<style>" \
           "html, body, [data-testid='stAppViewContainer'], [data-testid='stSidebar'] {direction: rtl;}" \
           ".block-container {padding-top: 1rem;}" \
@@ -260,29 +351,57 @@ rtl_css = "<style>" \
           "</style>"
 st.markdown(rtl_css, unsafe_allow_html=True)
 
+# Init DB and seed
 init_db()
 seed_defaults()
+bootstrap_admin_if_needed()
+
 settings = list_settings()
 
-# Sidebar identity (used for permissions and as default 'created_by')
-st.sidebar.header("זהות משתמש")
-user_name = st.sidebar.text_input("שם / מייל", value=st.session_state.get("user_name", ""))
-if user_name != st.session_state.get("user_name"):
-    st.session_state["user_name"] = user_name
+# ---------------- Authentication gate ----------------
+def _logout():
+    st.session_state.pop("auth_email", None)
+    st.session_state.pop("auth_user", None)
 
-user_is_admin = is_admin(user_name)
-if user_is_admin:
-    st.sidebar.success("מחובר כמנהל")
-elif can_create_directive(user_name):
-    st.sidebar.info("יש לך הרשאה ליצור הנחיות")
-else:
-    st.sidebar.caption("אין הרשאות מנהל או יצירת הנחיות")
+def _refresh_auth_user():
+    email = st.session_state.get("auth_email")
+    if not email:
+        st.session_state["auth_user"] = None
+        return
+    u = find_user_by_email(email)
+    st.session_state["auth_user"] = u
 
-# Header
-title = get_setting_value(settings, "app_title", "מרכז הדיווחים")
-subtitle = get_setting_value(settings, "app_subtitle", "מערכת דיווח יומית למחלקות")
+_refresh_auth_user()
+user = st.session_state.get("auth_user")
+
+if not user:
+    st.title(get_setting_value(settings, "app_title", "מרכז הדיווחים"))
+    st.caption(get_setting_value(settings, "app_subtitle", "מערכת דיווח יומית למחלקות"))
+    st.markdown("---")
+    st.subheader("התחברות")
+    with st.form("login_form"):
+        email = st.text_input("אימייל", value="")
+        password = st.text_input("סיסמה", type="password", value="")
+        submit = st.form_submit_button("התחבר")
+        if submit:
+            u = verify_login(email, password)
+            if u:
+                st.session_state["auth_email"] = u["email"]
+                st.session_state["auth_user"] = u
+                st.success("התחברת בהצלחה.")
+                st.experimental_rerun()
+            else:
+                st.error("פרטי התחברות שגויים או משתמש לא פעיל.")
+    st.info("מנהלים: ניתן להעלות קובץ משתמשים בעמוד 'הגדרות מנהל' (כאשר אתם מחוברים כמנהלים).")
+    st.stop()
+
+# At this point, user is authenticated
+user = st.session_state["auth_user"] or {}
+is_admin = (user.get("role") == "admin")
+can_create_dir = bool(user.get("can_create_directives")) or is_admin
+
+# Header (no user identity in sidebar; we show a small logout button there)
 logo = get_setting_value(settings, "app_logo", "")
-
 c1, c2 = st.columns([1, 6])
 with c1:
     if logo:
@@ -291,12 +410,18 @@ with c1:
         except Exception:
             st.write("")
 with c2:
-    st.title(title)
-    st.caption(subtitle)
+    st.title(get_setting_value(settings, "app_title", "מרכז הדיווחים"))
+    st.caption(get_setting_value(settings, "app_subtitle", "מערכת דיווח יומית למחלקות"))
 
-# Pages
+st.sidebar.title("ניווט")
+pages_all = ["לוח בקרה", "הגשת דיווח", "הנחיות", "מאגר דיווחים"]
+if is_admin:
+    pages_all.append("הגדרות מנהל")
+page = st.sidebar.radio("בחר עמוד:", pages_all, index=0)
 st.sidebar.markdown("---")
-page = st.sidebar.radio("ניווט", ["לוח בקרה", "הגשת דיווח", "הנחיות", "מאגר דיווחים", "הגדרות מנהל"], index=0)
+if st.sidebar.button("התנתק"):
+    _logout()
+    st.experimental_rerun()
 
 # ---------- Pages ----------
 if page == "לוח בקרה":
@@ -364,15 +489,16 @@ elif page == "הגשת דיווח":
             priority_level = st.selectbox("רמת עדיפות", options=["Low", "Medium", "High", "Critical"], index=1)
 
         additional_notes = st.text_area("הערות נוספות", height=80)
-        created_by_input = st.text_input("שם / מייל המדווח *", value=(user_name or ""))
+        created_by_name = st.text_input("שם היוצר *", value=(user.get("name") or ""))
 
         submitted = st.form_submit_button("הגש דיווח")
         if submitted:
-            if not created_by_input.strip():
-                st.error("יש להזין שם/מייל מדווח.")
+            if not created_by_name.strip():
+                st.error("יש להזין שם יוצר.")
             elif not (department and key_activities and production_amounts):
                 st.error("שדות חובה חסרים.")
             else:
+                created_by = created_by_name.strip() + " (" + (user.get("email") or "") + ")"
                 data = dict(
                     department=department,
                     report_date=report_date,
@@ -386,7 +512,7 @@ elif page == "הגשת דיווח":
                     },
                     additional_notes=(additional_notes or None),
                     status="submitted",
-                    created_by=created_by_input.strip()
+                    created_by=created_by
                 )
                 create_report(data)
                 st.success(f"דיווח למחלקת {department} הוגש בהצלחה!")
@@ -420,15 +546,15 @@ elif page == "הנחיות":
                 with c4:
                     st.metric("תאריך יעד", drow["due_date"])
 
-                if user_is_admin and drow["status"] == "active":
+                if is_admin and drow["status"] == "active":
                     if st.button(f"סמן כהושלם #{drow['id']}", key=f"complete_{drow['id']}"):
                         update_directive_status(drow["id"], "completed")
                         st.success("סטטוס ההנחיה עודכן בהצלחה!")
-                        st.rerun()
+                        st.experimental_rerun()
                 st.divider()
 
     with t_create:
-        if not can_create_directive(user_name):
+        if not can_create_dir:
             st.warning("אין לך הרשאה ליצור הנחיות. פנה למנהל המערכת.")
         else:
             depts = list_departments()
@@ -439,17 +565,16 @@ elif page == "הנחיות":
                 priority = st.selectbox("רמת עדיפות", ["Low", "Medium", "High", "Urgent"], index=1)
                 due_date = st.date_input("תאריך יעד *", value=date.today())
                 target_departments = st.multiselect("מחלקות יעד *", options=dept_names, default=[])
-                created_by_input = st.text_input("שם / מייל יוצר ההנחיה *", value=(user_name or ""))
+                created_by_name = st.text_input("שם יוצר ההנחיה *", value=(user.get("name") or ""))
 
                 submitted = st.form_submit_button("צור הנחיה")
                 if submitted:
-                    if not created_by_input.strip():
-                        st.error("יש להזין שם/מייל יוצר.")
+                    if not created_by_name.strip():
+                        st.error("יש להזין שם יוצר.")
                     elif not (title and description and target_departments and due_date):
                         st.error("שדות חובה חסרים.")
-                    elif not can_create_directive(created_by_input):
-                        st.error("אין הרשאה למשתמש זה ליצור הנחיות.")
                     else:
+                        created_by = created_by_name.strip() + " (" + (user.get("email") or "") + ")"
                         data = dict(
                             title=title,
                             description=description,
@@ -457,7 +582,7 @@ elif page == "הנחיות":
                             target_departments=target_departments,
                             due_date=due_date,
                             status="active",
-                            created_by=created_by_input.strip()
+                            created_by=created_by
                         )
                         create_directive(data)
                         st.success("ההנחיה נוצרה בהצלחה ונשלחה למחלקות היעד!")
@@ -556,11 +681,13 @@ elif page == "מאגר דיווחים":
         st.info("אין דיווח נבחר.")
 
 else:
-    if not user_is_admin:
+    # Admin-only
+    if not is_admin:
         st.error("גישה נדחתה: רק מנהלים יכולים לגשת להגדרות מנהל.")
     else:
         st.subheader("הגדרות מנהל")
 
+        # ---- Logo Management ----
         st.markdown("#### לוגו היישום")
         current_logo = next((s for s in settings if s["key"] == "app_logo"), None)
         if current_logo and (current_logo.get("file_url") or current_logo.get("value")):
@@ -572,14 +699,14 @@ else:
                 f.write(up.getbuffer())
             set_setting("app_logo", value=str(path), file_url=str(path))
             st.success("הלוגו עודכן.")
-            st.rerun()
-
+            st.experimental_rerun()
         if st.button("הסר לוגו"):
             set_setting("app_logo", value=None, file_url=None)
             st.success("הלוגו הוסר.")
-            st.rerun()
+            st.experimental_rerun()
 
         st.markdown("---")
+        # ---- App Texts ----
         st.markdown("#### ניהול טקסטים ביישום")
         keys = [
             "app_title","app_subtitle",
@@ -597,19 +724,19 @@ else:
             for k, v in edits.items():
                 set_setting(k, value=v)
             st.success("הטקסטים נשמרו.")
-            st.rerun()
+            st.experimental_rerun()
 
         st.markdown("---")
+        # ---- Departments ----
         st.markdown("#### ניהול מחלקות")
         depts = list_departments()
         new_name = st.text_input("שם מחלקה חדשה", value="")
-        if st.button("הוסף"):
+        if st.button("הוסף מחלקה"):
             if new_name.strip():
                 create_department(new_name.strip())
                 st.success("נוספה מחלקה.")
-                st.rerun()
+                st.experimental_rerun()
 
-        st.write("### רשימת מחלקות")
         for d in depts:
             c1, c2, c3 = st.columns([3, 1, 1])
             with c1:
@@ -618,9 +745,101 @@ else:
                 if st.button("שמור", key="save_" + str(d["id"])):
                     update_department(d["id"], new_val)
                     st.success("עודכן.")
-                    st.rerun()
+                    st.experimental_rerun()
             with c3:
                 if st.button("מחק", key="del_" + str(d["id"])):
                     delete_department(d["id"])
                     st.warning("נמחק.")
-                    st.rerun()
+                    st.experimental_rerun()
+
+        st.markdown("---")
+        # ---- Users Management ----
+        st.markdown("### ניהול משתמשים")
+        st.info("ניתן להעלות קובץ CSV עם עמודות: name,email,role,can_create_directives,is_active,password")
+
+        csv = st.file_uploader("העלה CSV משתמשים", type=["csv"])
+        if csv is not None:
+            try:
+                dfu = pd.read_csv(csv)
+                # Normalize columns
+                cols_need = ["name","email","role","can_create_directives","is_active","password"]
+                for c in cols_need:
+                    if c not in dfu.columns:
+                        dfu[c] = None
+                for _, row in dfu.iterrows():
+                    name = str(row.get("name") or "").strip()
+                    email = str(row.get("email") or "").strip()
+                    role = str(row.get("role") or "user").strip().lower()
+                    role = "admin" if role == "admin" else "user"
+                    can_dir = 1 if str(row.get("can_create_directives")).strip().lower() in ("1","true","yes","y") else 0
+                    active = 1 if str(row.get("is_active")).strip().lower() in ("1","true","yes","y") else 0
+                    pwd = None
+                    if row.get("password") is not None and str(row.get("password")).strip():
+                        pwd = str(row.get("password")).strip()
+                    if name and email:
+                        create_or_update_user(name, email, role, active, can_dir, password=pwd)
+                st.success("ייבוא המשתמשים הושלם.")
+                st.experimental_rerun()
+            except Exception as e:
+                st.error("שגיאה בייבוא הקובץ: " + str(e))
+
+        st.markdown("#### הוספת משתמש בודד")
+        with st.form("add_user_form"):
+            a1, a2 = st.columns(2)
+            with a1:
+                uname = st.text_input("שם *")
+                uemail = st.text_input("אימייל *")
+            with a2:
+                urole = st.selectbox("תפקיד", ["user","admin"], index=0)
+                udir = st.checkbox("הרשאת יצירת הנחיות", value=False)
+            uactive = st.checkbox("פעיל", value=True)
+            upwd = st.text_input("סיסמה (אם ריק, יוגדר 'changeme')", type="password", value="")
+            usubmit = st.form_submit_button("צור / עדכן משתמש")
+            if usubmit:
+                if not uname.strip() or not uemail.strip():
+                    st.error("שם ואימייל נדרשים.")
+                else:
+                    create_or_update_user(uname.strip(), uemail.strip(), urole, uactive, udir, password=(upwd or None))
+                    st.success("המשתמש נוצר/עודכן.")
+                    st.experimental_rerun()
+
+        st.markdown("#### רשימת משתמשים")
+        users = list_users()
+        if users:
+            dfusers = pd.DataFrame([{
+                "ID": u["id"],
+                "שם": u["name"],
+                "אימייל": u["email"],
+                "תפקיד": u["role"],
+                "יוצר הנחיות": bool(u["can_create_directives"]),
+                "פעיל": bool(u["is_active"]),
+                "נוצר": u["created_date"]
+            } for u in users])
+            st.dataframe(dfusers, use_container_width=True)
+
+            st.markdown("##### עדכון הרשאות / סטטוס / סיסמה")
+            uid = st.number_input("בחר מזהה משתמש (ID) לעדכון", min_value=users[0]["id"], max_value=users[-1]["id"], value=users[0]["id"], step=1)
+            sel = next((u for u in users if u["id"] == uid), None)
+            if sel:
+                b1, b2, b3 = st.columns(3)
+                with b1:
+                    role_new = st.selectbox("תפקיד", ["user","admin"], index=(0 if sel["role"]=="user" else 1))
+                with b2:
+                    active_new = st.checkbox("פעיל", value=bool(sel["is_active"]))
+                with b3:
+                    cdir_new = st.checkbox("הרשאת יצירת הנחיות", value=bool(sel["can_create_directives"]))
+
+                if st.button("שמור הרשאות"):
+                    create_or_update_user(sel["name"], sel["email"], role_new, active_new, cdir_new, password=None)
+                    st.success("עודכן.")
+                    st.experimental_rerun()
+
+                newpass = st.text_input("סיסמה חדשה", type="password", value="")
+                if st.button("אפס/הגדר סיסמה"):
+                    if not newpass.strip():
+                        st.error("יש להזין סיסמה חדשה.")
+                    else:
+                        set_user_password(sel["id"], newpass.strip())
+                        st.success("סיסמה עודכנה.")
+        else:
+            st.info("אין משתמשים במערכת (פרט למנהל ברירת מחדל).")
