@@ -1,4 +1,4 @@
-# Daily_report.py — Hebrew UI, RTL, login with users DB, admin/user roles, directive permissions
+# Daily_report.py — Hebrew UI, RTL, Login+Register, users DB, admin + directive permissions
 import os
 import json
 import sqlite3
@@ -133,36 +133,25 @@ def seed_defaults():
                 c.execute("INSERT OR IGNORE INTO departments (name) VALUES (?);", (name,))
         conn.commit()
 
-def bootstrap_admin_if_needed():
-    with get_conn() as conn:
-        c = conn.cursor()
-        n = c.execute("SELECT COUNT(*) AS n FROM users;").fetchone()["n"]
-        if n == 0:
-            # Bootstrap admin on first run. You can override via env vars.
-            email = os.environ.get("REPORTHUB_BOOTSTRAP_ADMIN_EMAIL", "admin@local")
-            pwd = os.environ.get("REPORTHUB_BOOTSTRAP_ADMIN_PASSWORD", "admin")
-            name = os.environ.get("REPORTHUB_BOOTSTRAP_ADMIN_NAME", "מנהל מערכת")
-            salt = _new_salt()
-            ph = _hash_password(pwd, salt)
-            c.execute(
-                "INSERT INTO users (name,email,role,can_create_directives,is_active,password_hash,salt) "
-                "VALUES (?,?,?,?,?,?,?);",
-                (name, email.lower().strip(), "admin", 1, 1, ph, salt)
-            )
-            conn.commit()
-
 # ---------------- Users (CRUD + Auth) ----------------
-def list_users():
-    with get_conn() as conn:
-        rows = conn.execute("SELECT * FROM users ORDER BY role DESC, name;").fetchall()
-        return [dict(r) for r in rows]
-
 def find_user_by_email(email: str):
     if not email:
         return None
     with get_conn() as conn:
         row = conn.execute("SELECT * FROM users WHERE lower(email)=?;", (email.strip().lower(),)).fetchone()
         return dict(row) if row else None
+
+def find_user_by_name(name: str):
+    if not name:
+        return None
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM users WHERE lower(name)=?;", (name.strip().lower(),)).fetchone()
+        return dict(row) if row else None
+
+def list_users():
+    with get_conn() as conn:
+        rows = conn.execute("SELECT * FROM users ORDER BY role DESC, name;").fetchall()
+        return [dict(r) for r in rows]
 
 def create_or_update_user(name, email, role, is_active, can_create_directives, password=None):
     email_norm = (email or "").strip().lower()
@@ -203,8 +192,13 @@ def set_user_password(user_id: int, new_password: str):
         conn.execute("UPDATE users SET password_hash=?, salt=? WHERE id=?;", (ph, salt, user_id))
         conn.commit()
 
-def verify_login(email: str, password: str):
-    u = find_user_by_email(email)
+def verify_login(identifier: str, password: str):
+    # identifier can be email OR name
+    u = None
+    if identifier and "@" in identifier:
+        u = find_user_by_email(identifier)
+    if u is None:
+        u = find_user_by_name(identifier)
     if not u:
         return None
     if not u.get("is_active"):
@@ -215,7 +209,22 @@ def verify_login(email: str, password: str):
         return u
     return None
 
-# ---------------- Settings & Data (Reports/Directives) ----------------
+def ensure_core_users():
+    """
+    Ensure the requested core users exist (insert-or-update):
+    - Admin: Oren Savir / 041294 (admin, can_create_directives=1)
+    - Managers (admins with directives): Jacky Bardugo / 123456, Baruch Hershkobitz / 678910
+    Emails are auto-assigned as @local.
+    """
+    core = [
+        dict(name="Oren Savir", email="oren@local", role="admin", is_active=1, can_create_directives=1, password="041294"),
+        dict(name="Jacky Bardugo", email="jacky@local", role="admin", is_active=1, can_create_directives=1, password="123456"),
+        dict(name="Baruch Hershkobitz", email="baruch@local", role="admin", is_active=1, can_create_directives=1, password="678910"),
+    ]
+    for u in core:
+        create_or_update_user(**u)
+
+# ---------------- Reports & Directives ----------------
 def list_departments():
     with get_conn() as conn:
         rows = conn.execute("SELECT id,name FROM departments ORDER BY name;").fetchall()
@@ -267,15 +276,14 @@ def list_reports(order="-created_date"):
         for r in rows:
             d = dict(r)
             d["metrics"] = json.loads(d["metrics"]) if d["metrics"] else {}
-            return_row = d
-            out.append(return_row)
+            out.append(d)
         return out
 
 def create_report(data):
     metrics = data.get("metrics") or {}
     he_map = {"נמוכה":"Low","בינונית":"Medium","גבוהה":"High","קריטית":"Critical"}
     if metrics.get("priority_level") in he_map:
-        metrics["priority_level"] = he_map["priority_level"]
+        metrics["priority_level"] = he_map[metrics["priority_level"]]
     payload = (
         data["department"],
         str(data["report_date"]),
@@ -354,45 +362,84 @@ st.markdown(rtl_css, unsafe_allow_html=True)
 # Init DB and seed
 init_db()
 seed_defaults()
-bootstrap_admin_if_needed()
+ensure_core_users()  # Make sure your specified admin+managers exist
 
 settings = list_settings()
 
-# ---------------- Authentication gate ----------------
+# ---------------- Session auth helpers ----------------
 def _logout():
-    st.session_state.pop("auth_email", None)
+    st.session_state.pop("auth_identifier", None)
     st.session_state.pop("auth_user", None)
 
 def _refresh_auth_user():
-    email = st.session_state.get("auth_email")
-    if not email:
+    ident = st.session_state.get("auth_identifier")
+    if not ident:
         st.session_state["auth_user"] = None
         return
-    u = find_user_by_email(email)
+    u = None
+    if "@" in ident:
+        u = find_user_by_email(ident)
+    if u is None:
+        u = find_user_by_name(ident)
     st.session_state["auth_user"] = u
 
 _refresh_auth_user()
 user = st.session_state.get("auth_user")
 
+# ---------------- Auth gate: Login / Register ----------------
 if not user:
-    st.title(get_setting_value(settings, "app_title", "מרכז הדיווחים"))
-    st.caption(get_setting_value(settings, "app_subtitle", "מערכת דיווח יומית למחלקות"))
+    title = get_setting_value(settings, "app_title", "מרכז הדיווחים")
+    subtitle = get_setting_value(settings, "app_subtitle", "מערכת דיווח יומית למחלקות")
+    st.title(title)
+    st.caption(subtitle)
     st.markdown("---")
-    st.subheader("התחברות")
-    with st.form("login_form"):
-        email = st.text_input("אימייל", value="")
-        password = st.text_input("סיסמה", type="password", value="")
-        submit = st.form_submit_button("התחבר")
-        if submit:
-            u = verify_login(email, password)
-            if u:
-                st.session_state["auth_email"] = u["email"]
-                st.session_state["auth_user"] = u
-                st.success("התחברת בהצלחה.")
-                st.experimental_rerun()
-            else:
-                st.error("פרטי התחברות שגויים או משתמש לא פעיל.")
-    st.info("מנהלים: ניתן להעלות קובץ משתמשים בעמוד 'הגדרות מנהל' (כאשר אתם מחוברים כמנהלים).")
+
+    tab_login, tab_register = st.tabs(["התחברות", "הרשמה"])
+
+    with tab_login:
+        st.subheader("כניסה לחשבון")
+        with st.form("login_form"):
+            ident = st.text_input("אימייל או שם", value="")
+            password = st.text_input("סיסמה", type="password", value="")
+            submit = st.form_submit_button("התחבר")
+            if submit:
+                u = verify_login(ident, password)
+                if u:
+                    st.session_state["auth_identifier"] = ident
+                    st.session_state["auth_user"] = u
+                    st.success("התחברת בהצלחה.")
+                    st.rerun()
+                else:
+                    st.error("פרטי התחברות שגויים או משתמש לא פעיל.")
+
+        st.info("טיפ: ניתן להתחבר עם **שם** (למשל 'Oren Savir') או עם **אימייל** (למשל 'oren@local').")
+
+    with tab_register:
+        st.subheader("הרשמה משתמש חדש")
+        st.caption("הרשמה יוצרת משתמש פעיל ברמת 'user'. מנהל יכול לשדרג הרשאות מאוחר יותר.")
+        with st.form("register_form", clear_on_submit=True):
+            name_new = st.text_input("שם מלא *", value="")
+            email_new = st.text_input("אימייל *", value="")
+            pwd1 = st.text_input("סיסמה *", type="password", value="")
+            pwd2 = st.text_input("אימות סיסמה *", type="password", value="")
+            reg = st.form_submit_button("הרשם")
+            if reg:
+                if not (name_new.strip() and email_new.strip() and pwd1 and pwd2):
+                    st.error("יש למלא את כל השדות המסומנים *.")
+                elif pwd1 != pwd2:
+                    st.error("הסיסמאות אינן תואמות.")
+                elif find_user_by_email(email_new):
+                    st.error("אימייל זה כבר קיים במערכת.")
+                else:
+                    create_or_update_user(
+                        name=name_new.strip(),
+                        email=email_new.strip(),
+                        role="user",
+                        is_active=1,
+                        can_create_directives=0,
+                        password=pwd1
+                    )
+                    st.success("נרשמת בהצלחה! כעת ניתן להתחבר.")
     st.stop()
 
 # At this point, user is authenticated
@@ -400,7 +447,7 @@ user = st.session_state["auth_user"] or {}
 is_admin = (user.get("role") == "admin")
 can_create_dir = bool(user.get("can_create_directives")) or is_admin
 
-# Header (no user identity in sidebar; we show a small logout button there)
+# Header & nav
 logo = get_setting_value(settings, "app_logo", "")
 c1, c2 = st.columns([1, 6])
 with c1:
@@ -419,9 +466,10 @@ if is_admin:
     pages_all.append("הגדרות מנהל")
 page = st.sidebar.radio("בחר עמוד:", pages_all, index=0)
 st.sidebar.markdown("---")
+st.sidebar.write(f"מחובר כ־ **{user.get('name','')}**")
 if st.sidebar.button("התנתק"):
     _logout()
-    st.experimental_rerun()
+    st.rerun()
 
 # ---------- Pages ----------
 if page == "לוח בקרה":
@@ -498,7 +546,7 @@ elif page == "הגשת דיווח":
             elif not (department and key_activities and production_amounts):
                 st.error("שדות חובה חסרים.")
             else:
-                created_by = created_by_name.strip() + " (" + (user.get("email") or "") + ")"
+                created_by = f"{created_by_name.strip()} ({user.get('email','')})"
                 data = dict(
                     department=department,
                     report_date=report_date,
@@ -546,11 +594,11 @@ elif page == "הנחיות":
                 with c4:
                     st.metric("תאריך יעד", drow["due_date"])
 
-                if is_admin and drow["status"] == "active":
+                if (user.get("role") == "admin") and drow["status"] == "active":
                     if st.button(f"סמן כהושלם #{drow['id']}", key=f"complete_{drow['id']}"):
                         update_directive_status(drow["id"], "completed")
                         st.success("סטטוס ההנחיה עודכן בהצלחה!")
-                        st.experimental_rerun()
+                        st.rerun()
                 st.divider()
 
     with t_create:
@@ -574,7 +622,7 @@ elif page == "הנחיות":
                     elif not (title and description and target_departments and due_date):
                         st.error("שדות חובה חסרים.")
                     else:
-                        created_by = created_by_name.strip() + " (" + (user.get("email") or "") + ")"
+                        created_by = f"{created_by_name.strip()} ({user.get('email','')})"
                         data = dict(
                             title=title,
                             description=description,
@@ -699,11 +747,11 @@ else:
                 f.write(up.getbuffer())
             set_setting("app_logo", value=str(path), file_url=str(path))
             st.success("הלוגו עודכן.")
-            st.experimental_rerun()
+            st.rerun()
         if st.button("הסר לוגו"):
             set_setting("app_logo", value=None, file_url=None)
             st.success("הלוגו הוסר.")
-            st.experimental_rerun()
+            st.rerun()
 
         st.markdown("---")
         # ---- App Texts ----
@@ -724,7 +772,7 @@ else:
             for k, v in edits.items():
                 set_setting(k, value=v)
             st.success("הטקסטים נשמרו.")
-            st.experimental_rerun()
+            st.rerun()
 
         st.markdown("---")
         # ---- Departments ----
@@ -735,7 +783,7 @@ else:
             if new_name.strip():
                 create_department(new_name.strip())
                 st.success("נוספה מחלקה.")
-                st.experimental_rerun()
+                st.rerun()
 
         for d in depts:
             c1, c2, c3 = st.columns([3, 1, 1])
@@ -745,12 +793,12 @@ else:
                 if st.button("שמור", key="save_" + str(d["id"])):
                     update_department(d["id"], new_val)
                     st.success("עודכן.")
-                    st.experimental_rerun()
+                    st.rerun()
             with c3:
                 if st.button("מחק", key="del_" + str(d["id"])):
                     delete_department(d["id"])
                     st.warning("נמחק.")
-                    st.experimental_rerun()
+                    st.rerun()
 
         st.markdown("---")
         # ---- Users Management ----
@@ -761,7 +809,6 @@ else:
         if csv is not None:
             try:
                 dfu = pd.read_csv(csv)
-                # Normalize columns
                 cols_need = ["name","email","role","can_create_directives","is_active","password"]
                 for c in cols_need:
                     if c not in dfu.columns:
@@ -779,11 +826,11 @@ else:
                     if name and email:
                         create_or_update_user(name, email, role, active, can_dir, password=pwd)
                 st.success("ייבוא המשתמשים הושלם.")
-                st.experimental_rerun()
+                st.rerun()
             except Exception as e:
                 st.error("שגיאה בייבוא הקובץ: " + str(e))
 
-        st.markdown("#### הוספת משתמש בודד")
+        st.markdown("#### הוספת / עדכון משתמש בודד")
         with st.form("add_user_form"):
             a1, a2 = st.columns(2)
             with a1:
@@ -801,7 +848,7 @@ else:
                 else:
                     create_or_update_user(uname.strip(), uemail.strip(), urole, uactive, udir, password=(upwd or None))
                     st.success("המשתמש נוצר/עודכן.")
-                    st.experimental_rerun()
+                    st.rerun()
 
         st.markdown("#### רשימת משתמשים")
         users = list_users()
@@ -818,7 +865,8 @@ else:
             st.dataframe(dfusers, use_container_width=True)
 
             st.markdown("##### עדכון הרשאות / סטטוס / סיסמה")
-            uid = st.number_input("בחר מזהה משתמש (ID) לעדכון", min_value=users[0]["id"], max_value=users[-1]["id"], value=users[0]["id"], step=1)
+            ids = [u["id"] for u in users]
+            uid = st.number_input("בחר מזהה משתמש (ID) לעדכון", min_value=min(ids), max_value=max(ids), value=min(ids), step=1)
             sel = next((u for u in users if u["id"] == uid), None)
             if sel:
                 b1, b2, b3 = st.columns(3)
@@ -827,12 +875,12 @@ else:
                 with b2:
                     active_new = st.checkbox("פעיל", value=bool(sel["is_active"]))
                 with b3:
-                    cdir_new = st.checkbox("הרשאת יצירת הנחיות", value=bool(sel["can_create_directives"]))
+                    cdir_new = st.checkbox("הרשאת יצירת הנחיות (מנהל הנחיות)", value=bool(sel["can_create_directives"]))
 
                 if st.button("שמור הרשאות"):
                     create_or_update_user(sel["name"], sel["email"], role_new, active_new, cdir_new, password=None)
                     st.success("עודכן.")
-                    st.experimental_rerun()
+                    st.rerun()
 
                 newpass = st.text_input("סיסמה חדשה", type="password", value="")
                 if st.button("אפס/הגדר סיסמה"):
@@ -842,4 +890,4 @@ else:
                         set_user_password(sel["id"], newpass.strip())
                         st.success("סיסמה עודכנה.")
         else:
-            st.info("אין משתמשים במערכת (פרט למנהל ברירת מחדל).")
+            st.info("אין משתמשים במערכת.")
