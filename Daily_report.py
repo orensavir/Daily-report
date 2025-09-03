@@ -7,6 +7,7 @@ import sqlite3
 import tempfile
 import hashlib
 import secrets
+import csv
 from pathlib import Path
 from datetime import datetime, date
 
@@ -864,13 +865,57 @@ elif page == "מאגר דיווחים":
             "נוצר": r.get("created_date",""),
             "יוצר": r.get("created_by","") or "",
         }
-    df = pd.DataFrame([to_row(x) for x in filtered])
-    st.dataframe(df, use_container_width=True)
-    if not df.empty:
-        csv = df.to_csv(index=False).encode("utf-8-sig")
-        st.download_button("הורד CSV", data=csv, file_name=f"reports_{date.today().isoformat()}.csv", mime="text/csv")
-    else:
-        st.info("לא נמצאו דיווחים תואמים למסננים.")
+# --- Summary table for viewing (unchanged behavior) ---
+df = pd.DataFrame([to_row(x) for x in filtered])
+st.dataframe(df, use_container_width=True)
+
+# --- Full export with ALL fields (new) ---
+if filtered:
+    export_rows = []
+    for r in filtered:
+        m = r.get("metrics") or {}
+        completed = int(m.get("tasks_completed", 0))
+        pending = int(m.get("tasks_pending", 0))
+        total = completed + pending
+        prio_en = m.get("priority_level", "Medium")
+        prio_he = {"Low": "נמוכה", "Medium": "בינונית", "High": "גבוהה", "Critical": "קריטית"}.get(prio_en, prio_en)
+
+        # Friendly date (dd/MM/yyyy) for report_date; keep created_date as-is (ISO)
+        try:
+            rep_date_str = datetime.fromisoformat(str(r.get("report_date"))).strftime("%d/%m/%Y")
+        except Exception:
+            rep_date_str = r.get("report_date", "")
+
+        export_rows.append({
+            "מזהה": r.get("id"),
+            "מחלקה": r.get("department", ""),
+            "תאריך": rep_date_str,
+            "פעילויות מרכזיות": r.get("key_activities", "") or "",
+            "כמויות ייצור": r.get("production_amounts", "") or "",
+            "אתגרים": r.get("challenges", "") or "",
+            "משימות שהושלמו": completed,
+            "משימות ממתינות": pending,
+            "סה״כ משימות": total,
+            "רמת עדיפות": prio_he,
+            "הערות נוספות": r.get("additional_notes", "") or "",
+            "סטטוס": r.get("status", "submitted"),
+            "תאריך יצירה": r.get("created_date", "") or "",
+            "נוצר על ידי": r.get("created_by", "") or "",
+        })
+
+    export_df = pd.DataFrame(export_rows)
+
+    # Use UTF-8 BOM for Hebrew in Excel, and keep numeric columns numeric.
+    csv_bytes = export_df.to_csv(index=False, quoting=csv.QUOTE_MINIMAL).encode("utf-8-sig")
+    st.download_button(
+        "הורד CSV (מלא)",
+        data=csv_bytes,
+        file_name=f"reports_full_{date.today().isoformat()}.csv",
+        mime="text/csv",
+    )
+else:
+    st.info("לא נמצאו דיווחים תואמים למסננים.")
+
 
     st.markdown("---")
     st.subheader("פרטי דיווח")
