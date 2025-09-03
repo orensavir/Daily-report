@@ -822,7 +822,7 @@ elif page == "מאגר דיווחים":
     dept_names = ["(הכול)"] + [d["name"] for d in departments]
     reports = list_reports(order="-created_date")
 
-    c1,c2,c3,c4 = st.columns([2,2,2,3])
+    c1, c2, c3, c4 = st.columns([2, 2, 2, 3])
     with c1:
         dept = st.selectbox("מחלקה", dept_names)
     with c2:
@@ -835,36 +835,127 @@ elif page == "מאגר דיווחים":
         search = st.text_input("חיפוש טקסט", value="")
 
     def include(r):
-        if dept != "(הכול)" and r["department"] != dept: return False
+        if dept != "(הכול)" and r["department"] != dept:
+            return False
         if use_from:
             try:
-                if date.fromisoformat(r["report_date"]) < from_date: return False
+                if date.fromisoformat(r["report_date"]) < from_date:
+                    return False
             except Exception:
                 pass
         if use_to:
             try:
-                if date.fromisoformat(r["report_date"]) > to_date: return False
+                if date.fromisoformat(r["report_date"]) > to_date:
+                    return False
             except Exception:
                 pass
         if search:
             s = search.lower()
-            fields = [r.get("key_activities",""), r.get("production_amounts",""), r.get("challenges") or "", r.get("department","") or ""]
-            if not any(s in (f or "").lower() for f in fields): return False
+            fields = [
+                r.get("key_activities", ""),
+                r.get("production_amounts", ""),
+                r.get("challenges") or "",
+                r.get("department", "") or "",
+            ]
+            if not any(s in (f or "").lower() for f in fields):
+                return False
         return True
 
     filtered = [r for r in reports if include(r)]
+
     def to_row(r):
         m = r.get("metrics") or {}
-        total = int(m.get("tasks_completed",0)) + int(m.get("tasks_pending",0))
+        total = int(m.get("tasks_completed", 0)) + int(m.get("tasks_pending", 0))
         return {
             "מחלקה": r["department"],
             "תאריך": r["report_date"],
-            "עדיפות": m.get("priority_level","Medium"),
-            "משימות": f"{int(m.get('tasks_completed',0))}/{total}",
-            "סטטוס": r.get("status","submitted"),
-            "נוצר": r.get("created_date",""),
-            "יוצר": r.get("created_by","") or "",
+            "עדיפות": m.get("priority_level", "Medium"),
+            "משימות": f"{int(m.get('tasks_completed', 0))}/{total}",
+            "סטטוס": r.get("status", "submitted"),
+            "נוצר": r.get("created_date", ""),
+            "יוצר": r.get("created_by", "") or "",
         }
+
+    # --- טבלת תצוגה (למסך) ---
+    df = pd.DataFrame([to_row(x) for x in filtered])
+    st.dataframe(df, use_container_width=True)
+
+    # --- יצוא CSV מלא עם כל השדות ---
+    if filtered:
+        export_rows = []
+        for r in filtered:
+            m = r.get("metrics") or {}
+            completed = int(m.get("tasks_completed", 0))
+            pending = int(m.get("tasks_pending", 0))
+            total = completed + pending
+            prio_en = m.get("priority_level", "Medium")
+            prio_he = {
+                "Low": "נמוכה",
+                "Medium": "בינונית",
+                "High": "גבוהה",
+                "Critical": "קריטית",
+            }.get(prio_en, prio_en)
+
+            # dd/MM/yyyy for report_date; keep created_date ISO
+            try:
+                rep_date_str = datetime.fromisoformat(str(r.get("report_date"))).strftime("%d/%m/%Y")
+            except Exception:
+                rep_date_str = r.get("report_date", "")
+
+            export_rows.append(
+                {
+                    "מזהה": r.get("id"),
+                    "מחלקה": r.get("department", ""),
+                    "תאריך": rep_date_str,
+                    "פעילויות מרכזיות": r.get("key_activities", "") or "",
+                    "כמויות ייצור": r.get("production_amounts", "") or "",
+                    "אתגרים": r.get("challenges", "") or "",
+                    "משימות שהושלמו": completed,
+                    "משימות ממתינות": pending,
+                    "סה״כ משימות": total,
+                    "רמת עדיפות": prio_he,
+                    "הערות נוספות": r.get("additional_notes", "") or "",
+                    "סטטוס": r.get("status", "submitted"),
+                    "תאריך יצירה": r.get("created_date", "") or "",
+                    "נוצר על ידי": r.get("created_by", "") or "",
+                }
+            )
+
+        export_df = pd.DataFrame(export_rows)
+        csv_bytes = export_df.to_csv(index=False, quoting=csv.QUOTE_MINIMAL).encode("utf-8-sig")
+        st.download_button(
+            "הורד CSV (מלא)",
+            data=csv_bytes,
+            file_name=f"reports_full_{date.today().isoformat()}.csv",
+            mime="text/csv",
+        )
+    else:
+        st.info("לא נמצאו דיווחים תואמים למסננים.")
+
+    st.markdown("---")
+    st.subheader("פרטי דיווח")
+    if filtered:
+        idx = st.number_input("בחר אינדקס (0-מבוסס)", min_value=0, max_value=len(filtered) - 1, value=0)
+        r = filtered[int(idx)]
+        st.write(f"### {r['department']} — {r['report_date']}")
+        m = r.get("metrics") or {}
+        c1x, c2x, c3x = st.columns(3)
+        with c1x:
+            st.metric("משימות שהושלמו", int(m.get("tasks_completed", 0)))
+        with c2x:
+            st.metric("משימות ממתינות", int(m.get("tasks_pending", 0)))
+        with c3x:
+            st.metric("רמת עדיפות", m.get("priority_level", "Medium"))
+        st.write("**פעילויות מרכזיות**\n\n" + (r.get("key_activities", "") or ""))
+        st.write("**כמויות ייצור**\n\n" + (r.get("production_amounts", "") or ""))
+        if r.get("challenges"):
+            st.write("**אתגרים ובעיות**\n\n" + r["challenges"])
+        if r.get("additional_notes"):
+            st.write("**הערות נוספות**\n\n" + r["additional_notes"])
+        st.caption(f"נוצר: {r.get('created_date','')} | על ידי: {r.get('created_by','') or ''}")
+    else:
+        st.info("אין דיווח נבחר.")
+
 # --- Summary table for viewing (unchanged behavior) ---
 df = pd.DataFrame([to_row(x) for x in filtered])
 st.dataframe(df, use_container_width=True)
